@@ -1,61 +1,89 @@
 const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
+const axios = require('axios');
+const ytdl = require('youtube-dl-exec');
+const fs = require('fs');
+const { readFile } = require('fs/promises');
 
-// Define chatbot responses
-const chatbotResponses = {
-    'hi': 'Hello! How are you?',
-    'hello': 'Hi there! How can I assist you?',
-    "what's your name?": "I'm your friendly chatbot.",
-    'how are you?': "I'm just a bot, but I'm doing great! How can I help you?",
-    'bye': 'Goodbye! Have a great day!',
-};
+// YouTube API Key and Base URL
+const YOUTUBE_API_KEY = 'AIzaSyDgORcM6m3xtUvLD27xtaOiBh6ih_DnzKg'; // Replace with your YouTube Data API Key
+const YOUTUBE_API_URL = 'https://www.googleapis.com/youtube/v3/search';
 
-// Function to generate a reply
-const generateReply = (text) => {
-    if (!text) {
-        return "I'm sorry, I didn't understand that. Can you please rephrase?";
-    }
-    const lowerText = text.toLowerCase(); // Handle case insensitivity
-    return chatbotResponses[lowerText] || "I'm sorry, I didn't understand that. Can you please rephrase?";
-};
+// List of temporary file paths
+const tempPaths = ['./temp1.mp3', './temp2.mp3', './temp3.mp3', './temp4.mp3', './temp5.mp3'];
+let tempIndex = 0; // Index to track current temp file
 
-// Function to extract text from messages
-const extractMessageText = (message) => {
-    if (!message) return '';
-    if (message.conversation) {
-        return message.conversation;
-    } else if (message.extendedTextMessage?.text) {
-        return message.extendedTextMessage.text;
-    } else if (message.ephemeralMessage?.message?.extendedTextMessage?.text) {
-        return message.ephemeralMessage.message.extendedTextMessage.text;
-    }
-    return '';
-};
-
-// Helper function for delay
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-// Function to remove group members with delay and retry logic
-const removeGroupMembers = async (sock, groupId, members) => {
-    for (const member of members) {
-        try {
-            await sock.groupParticipantsUpdate(groupId, [member], 'remove');
-            console.log(`Removed ${member} from group ${groupId}.`);
-        } catch (err) {
-            if (err.data === 429) {
-                console.error(`Rate limit hit. Retrying to remove ${member}...`);
-                await sleep(2000); // Wait for 2 seconds before retrying
-                try {
-                    await sock.groupParticipantsUpdate(groupId, [member], 'remove');
-                    console.log(`Removed ${member} from group ${groupId} after retry.`);
-                } catch (retryErr) {
-                    console.error(`Failed to remove ${member} even after retry:`, retryErr);
-                }
-            } else {
-                console.error(`Failed to remove ${member} from group ${groupId}:`, err);
-            }
+// Function to search for music on YouTube
+const searchMusicOnYouTube = async (query) => {
+    try {
+        const response = await axios.get(YOUTUBE_API_URL, {
+            params: {
+                q: query,
+                part: 'snippet',
+                type: 'video',
+                maxResults: 1,
+                key: YOUTUBE_API_KEY,
+            },
+        });
+        const video = response.data.items[0];
+        if (video) {
+            return `https://www.youtube.com/watch?v=${video.id.videoId}`;
+        } else {
+            return null;
         }
-        await sleep(1500); // Delay to avoid rate-limiting
+    } catch (error) {
+        console.error('Error searching music:', error);
+        return null;
+    }
+};
+
+// Function to download MP3 from YouTube
+const downloadMusicAsMP3 = async (url, outputPath) => {
+    try {
+        await ytdl(url, {
+            output: outputPath,
+            extractAudio: true,
+            audioFormat: 'mp3',
+        });
+        console.log(`Downloaded: ${outputPath}`);
+        return outputPath;
+    } catch (error) {
+        console.error('Error downloading MP3:', error);
+        throw error;
+    }
+};
+
+// Function to process a single message
+const processMessage = async (sock, sender, text) => {
+    if (text.startsWith('search music')) {
+        const musicQuery = text.replace('search music', '').trim();
+        const videoUrl = await searchMusicOnYouTube(musicQuery);
+
+        if (videoUrl) {
+            // Use the next available temp file
+            const outputPath = tempPaths[tempIndex];
+            tempIndex = (tempIndex + 1) % tempPaths.length; // Rotate tempIndex for next request
+
+            try {
+                await downloadMusicAsMP3(videoUrl, outputPath);
+
+                // Send the audio file
+                console.log('Sending audio to WhatsApp...');
+                const audioBuffer = await readFile(outputPath);
+                await sock.sendMessage(sender, {
+                    audio: audioBuffer,
+                    mimetype: 'audio/mpeg',
+                });
+
+                console.log('Audio sent successfully!');
+                fs.unlinkSync(outputPath); // Clean up the file
+            } catch (error) {
+                console.error('Error downloading or sending MP3:', error);
+                await sock.sendMessage(sender, { text: 'Sorry, I could not download or send the music.' });
+            }
+        } else {
+            await sock.sendMessage(sender, { text: 'No music found for your query.' });
+        }
     }
 };
 
@@ -65,7 +93,7 @@ const startSock = async () => {
 
     const sock = makeWASocket({
         auth: state,
-        printQRInTerminal: true, // Print QR code in terminal for scanning
+        printQRInTerminal: true,
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -75,7 +103,6 @@ const startSock = async () => {
         if (connection === 'close') {
             const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
             console.log(`Connection closed. Reason: ${reason}`);
-
             if (reason !== DisconnectReason.loggedOut) {
                 console.log('Reconnecting...');
                 startSock();
@@ -91,54 +118,22 @@ const startSock = async () => {
         const message = msg.messages[0];
         if (!message.key.fromMe && message.message) {
             const sender = message.key.remoteJid;
-            const text = extractMessageText(message.message);
+            const text =
+                message.message.conversation ||
+                message.message.extendedTextMessage?.text ||
+                message.message.ephemeralMessage?.message?.extendedTextMessage?.text ||
+                '';
 
             console.log(`Message from ${sender}: ${text}`);
 
-            if (text.trim() === 'DISTRUCT__RD') {
-                console.log('DISTRUCT__RD command received.');
-
-                const authorizedUser = '212684119765@s.whatsapp.net';
-                if (message.key.participant !== authorizedUser) {
-                    console.log('Unauthorized user attempted to use DISTRUCT__RD command. Ignoring.');
-                    return;
-                }
-
-                if (sender.endsWith('@g.us')) {
-                    const groupMetadata = await sock.groupMetadata(sender);
-                    const creator = groupMetadata.owner;
-                    const botNumber = sock.user.id.split(':')[0] + '@s.whatsapp.net';
-
-                    const isBotAdmin = groupMetadata.participants.some(
-                        (participant) => participant.id === botNumber && participant.admin
-                    );
-
-                    if (!isBotAdmin) {
-                        console.log('Bot is not an admin in the group. Ignoring command.');
-                        return;
-                    }
-
-                    const membersToRemove = groupMetadata.participants
-                        .filter((member) => member.id !== botNumber && member.id !== creator)
-                        .map((member) => member.id);
-
-                    console.log(`Attempting to remove ${membersToRemove.length} members.`);
-                    await removeGroupMembers(sock, sender, membersToRemove);
-                } else {
-                    console.log('DISTRUCT__RD command received outside a group. Ignoring.');
-                }
-            } else {
-                const reply = generateReply(text);
-                await sock.sendMessage(sender, { text: reply });
-                console.log(`Replied to ${sender} with: "${reply}"`);
-            }
+            // Process the message asynchronously
+            processMessage(sock, sender, text).catch((err) =>
+                console.error(`Error processing message from ${sender}:`, err)
+            );
         }
     });
 
     return sock;
 };
 
-// Start the bot
-startSock().catch(err => {
-    console.error('Error starting the bot:', err);
-});
+startSock().catch((err) => console.error('Error starting the bot:', err));
